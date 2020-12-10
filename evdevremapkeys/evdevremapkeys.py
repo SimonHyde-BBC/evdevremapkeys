@@ -26,6 +26,7 @@ import asyncio
 import functools
 from pathlib import Path
 import signal
+import copy
 
 
 import evdev
@@ -38,6 +39,7 @@ DEFAULT_RATE = .1  # seconds
 repeat_tasks = {}
 remapped_tasks = {}
 registered_devices = {}
+saved_values = {}
 
 
 @asyncio.coroutine
@@ -46,6 +48,8 @@ async def handle_events(input, output, remappings, modifier_groups):
     try:
         while True:
             async for event in input.async_read_loop():
+                if event.type == ecodes.EV_SYN:
+                    continue
                 if not active_group:
                     active_mappings = remappings
                 else:
@@ -86,12 +90,25 @@ def repeat_event(event, rate, count, values, output):
         yield from asyncio.sleep(rate)
 
 
-def remap_event(output, event, event_remapping):
+def remap_event(output, event_in, event_remapping):
     for remapping in event_remapping:
+        event = copy.deepcopy(event_in)
         original_code = event.code
+        if 'ignore_values' in remapping:
+            if event.value in remapping['ignore_values']:
+                continue
+        if 'save_value' in remapping:
+            saved_values[remapping['save_value']] = event.value
+            continue
         event.code = remapping['code']
         event.type = remapping.get('type', None) or event.type
         values = remapping.get('value', None) or [event.value]
+        if 'recall_value' in remapping:
+            save_name = remapping['recall_value']
+            if save_name in saved_values:
+                values = [ saved_values[save_name] ]
+            else:
+                continue
         repeat = remapping.get('repeat', False)
         delay = remapping.get('delay', False)
         if not repeat and not delay:
@@ -306,21 +323,24 @@ def register_device(device):
     remove_caps = {}
 
     for cap in caps_sets:
-        remove_caps[cap] = set();
+        remove_caps[cap] = {};
         for remapping in remappings:
             for data in caps_sets[cap]:
                 if remapping == data or (type(data) is tuple and data[0] == remapping):
-                        remove_caps[cap].add(data)
+                        remove_caps[cap][remapping] = data
 
     for cap in remove_caps:
-        caps_sets[cap].difference_update(remove_caps[cap])
+        caps_sets[cap].difference_update(remove_caps[cap].values())
 
     for remapping in flatmap(remappings.values()):
         update_type = ecodes.EV_KEY
         if 'type' in remapping:
             update_type = remapping['type'];
         if 'code' in remapping:
-            caps_sets.setdefault(update_type,set()).update([remapping['code']])
+            data = remapping['code']
+            if data in remove_caps[update_type]:
+                data = remove_caps[update_type][data];
+            caps_sets.setdefault(update_type,set()).update([data])
 
     for group in modifier_groups:
         for remapping in flatmap(modifier_groups[group].values()):
@@ -328,7 +348,10 @@ def register_device(device):
             if 'type' in remapping:
                 update_type = remapping['type'];
             if 'code' in remapping:
-                caps_sets.setdefault(update_type,set()).update([remapping['code']])
+                data = remapping['code']
+                if data in remove_caps[update_type]:
+                    data = remove_caps[update_type][data];
+                caps_sets.setdefault(update_type,set()).update([data])
 
     caps = {}
 
